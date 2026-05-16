@@ -5,7 +5,8 @@ summary.
 
 The Python tool reads `collection_summary.json` from the standardization
 collection workflow, takes `collection.multipolygon_wkt`, computes the WGS84
-centroid, and looks that point up in supplied vector datasets.
+centroid, and looks that point up in reference vector datasets stored in the
+Docker image.
 
 GADM provides administrative boundaries only. It does not contain forest biome
 or land-cover information. WWF Terrestrial Ecoregions v2.0 provides the
@@ -14,17 +15,25 @@ ecoregion, realm, and biome context.
 ## Inputs
 
 - `--collection-summary`: JSON file produced by `tool_standard` collection mode.
-- `--gadm-path`: Optional GADM vector dataset, usually a `.gpkg` or `.shp`.
+- `--metadata-layers`: Comma-separated layer list. Supported values are `gadm`
+  and `ecoregion`.
+- `--reference-data-dir`: Directory containing reference data inside the Docker
+  image. Defaults to `/reference-data`.
+- `--gadm-path`: Optional override for the GADM vector dataset, usually a
+  `.gpkg` or `.shp`.
 - `--gadm-layer`: Optional layer name. If omitted for a multi-layer dataset, all
   layers are checked and the deepest matching administrative level is selected.
-- `--wwf-ecoregions-path`: Optional WWF Terrestrial Ecoregions v2.0 vector
-  dataset, usually `wwf_terr_ecos.shp`.
+- `--wwf-ecoregions-path`: Optional override for the WWF Terrestrial Ecoregions
+  v2.0 vector dataset, usually `wwf_terr_ecos.shp`.
 - `--wwf-ecoregions-layer`: Optional WWF layer name. If omitted, all layers are
   checked.
 
-At least one reference dataset is required. The GADM and WWF data bundles are
-intentionally not included in the image. Mount them at runtime so license terms
-and dataset versions remain explicit.
+The Docker image expects reference data under `/reference-data/gadm` and
+`/reference-data/ecoregion`. The checked-in files are small test fixtures. For a
+production image, replace them with the real GADM and WWF datasets before
+building. GADM licensing does not allow redistribution without permission, so
+public images should only bundle GADM data if the redistribution terms are
+cleared.
 
 ## Output
 
@@ -86,8 +95,7 @@ Default output is `additional_metadata.json`.
 ```bash
 python src/run.py \
   --collection-summary /in/collection_summary.json \
-  --gadm-path /data/gadm41_DEU.gpkg \
-  --wwf-ecoregions-path /data/wwf_terr_ecos.shp \
+  --metadata-layers gadm,ecoregion \
   --output-file /out/additional_metadata.json
 ```
 
@@ -98,11 +106,9 @@ docker build -t 3dtrees-metadata .
 docker run --rm \
   -v "$PWD/in:/in:ro" \
   -v "$PWD/out:/out" \
-  -v "$PWD/reference-data:/data:ro" \
   3dtrees-metadata \
   python /src/run.py \
   --collection-summary /in/collection_summary.json \
-  --gadm-path /data/gadm41_DEU.gpkg \
-  --wwf-ecoregions-path /data/wwf_terr_ecos.shp \
+  --metadata-layers gadm,ecoregion \
   --output-file /out/additional_metadata.json
 ```

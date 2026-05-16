@@ -5,14 +5,67 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import shutil
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import urlretrieve
+import zipfile
 
 import fiona
 from pyproj import CRS, Transformer
 from shapely.geometry import Point, shape
 from shapely.ops import transform
 from shapely import wkt
+
+
+SUPPORTED_METADATA_LAYERS = ("gadm", "ecoregion")
+DEFAULT_REFERENCE_DATA_DIR = "/reference-data"
+DEFAULT_GADM_URL = "https://geodata.ucdavis.edu/gadm/gadm4.1/gadm_410-gpkg.zip"
+DEFAULT_WWF_ECOREGIONS_URL = (
+    "https://files.worldwildlife.org/wwfcmsprod/files/Publication/file/"
+    "6kcchn7e3u_official_teow.zip"
+)
+
+REFERENCE_DATASETS = {
+    "gadm": {
+        "download_arg": "gadm_url",
+        "path_arg": "gadm_path",
+        "preferred_names": ("gadm_410.gpkg", "gadm.gpkg", "gadm_fixture.geojson"),
+        "extensions": (".gpkg", ".geojson", ".shp"),
+    },
+    "ecoregion": {
+        "download_arg": "wwf_ecoregions_url",
+        "path_arg": "wwf_ecoregions_path",
+        "preferred_names": (
+            "wwf_terr_ecos.shp",
+            "wwf_terr_ecos.gpkg",
+            "wwf_ecoregions.geojson",
+            "wwf_ecoregions_fixture.geojson",
+        ),
+        "extensions": (".shp", ".gpkg", ".geojson"),
+    },
+}
+
+
+def parse_metadata_layers(raw_value: str) -> list[str]:
+    normalized = (
+        raw_value.replace("[", "")
+        .replace("]", "")
+        .replace("'", "")
+        .replace('"', "")
+        .replace(" ", "")
+    )
+    layers = [layer for layer in normalized.split(",") if layer]
+    invalid_layers = [layer for layer in layers if layer not in SUPPORTED_METADATA_LAYERS]
+    if invalid_layers:
+        raise ValueError(
+            "Unsupported metadata layer(s): "
+            f"{', '.join(invalid_layers)}. Supported layers: "
+            f"{', '.join(SUPPORTED_METADATA_LAYERS)}"
+        )
+    return layers
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,6 +79,51 @@ def parse_args() -> argparse.Namespace:
         dest="collection_summary",
         required=True,
         help="collection_summary.json produced by tool_standard collection mode",
+    )
+    parser.add_argument(
+        "--metadata-layers",
+        "--metadata_layers",
+        dest="metadata_layers",
+        default="",
+        help="Comma-separated metadata layers to extract: gadm,ecoregion",
+    )
+    parser.add_argument(
+        "--reference-data-dir",
+        "--reference_data_dir",
+        dest="reference_data_dir",
+        default=os.environ.get(
+            "THREEDTREES_METADATA_REFERENCE_DIR", DEFAULT_REFERENCE_DATA_DIR
+        ),
+        help=(
+            "Directory used for cached reference datasets. Missing datasets are "
+            "downloaded into this directory."
+        ),
+    )
+    parser.add_argument(
+        "--download-missing-reference-data",
+        action="store_true",
+        help=(
+            "Download missing reference datasets into --reference-data-dir. "
+            "By default the tool expects reference data to be present in the Docker image."
+        ),
+    )
+    parser.add_argument(
+        "--gadm-url",
+        "--gadm_url",
+        dest="gadm_url",
+        default=os.environ.get("THREEDTREES_GADM_URL", DEFAULT_GADM_URL),
+        help="Download URL for the GADM reference dataset.",
+    )
+    parser.add_argument(
+        "--wwf-ecoregions-url",
+        "--wwf_ecoregions_url",
+        "--wwf-url",
+        "--wwf_url",
+        dest="wwf_ecoregions_url",
+        default=os.environ.get(
+            "THREEDTREES_WWF_ECOREGIONS_URL", DEFAULT_WWF_ECOREGIONS_URL
+        ),
+        help="Download URL for the WWF Terrestrial Ecoregions v2.0 dataset.",
     )
     parser.add_argument(
         "--gadm-path",
@@ -82,12 +180,22 @@ def parse_args() -> argparse.Namespace:
     collection_summary = Path(args.collection_summary)
     if not collection_summary.exists():
         parser.error(f"Collection summary does not exist: {collection_summary}")
-    if args.gadm_path and not Path(args.gadm_path).exists():
-        parser.error(f"GADM path does not exist: {args.gadm_path}")
-    if args.wwf_ecoregions_path and not Path(args.wwf_ecoregions_path).exists():
-        parser.error(f"WWF ecoregions path does not exist: {args.wwf_ecoregions_path}")
-    if not args.gadm_path and not args.wwf_ecoregions_path:
-        parser.error("At least one metadata layer input is required: --gadm-path or --wwf-ecoregions-path")
+    try:
+        selected_layers = parse_metadata_layers(args.metadata_layers)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if not selected_layers:
+        selected_layers = []
+        if args.gadm_path:
+            selected_layers.append("gadm")
+        if args.wwf_ecoregions_path:
+            selected_layers.append("ecoregion")
+
+    if not selected_layers:
+        parser.error("At least one metadata layer is required: gadm or ecoregion")
+
+    args.metadata_layers = selected_layers
 
     if args.output_file:
         output_file = Path(args.output_file)
@@ -97,6 +205,99 @@ def parse_args() -> argparse.Namespace:
     args.output_file = str(output_file)
 
     return args
+
+
+def reference_data_dir(args: argparse.Namespace, layer: str) -> Path:
+    return Path(args.reference_data_dir) / layer
+
+
+def find_reference_file(
+    search_dir: Path, preferred_names: tuple[str, ...], extensions: tuple[str, ...]
+) -> Path | None:
+    if not search_dir.exists():
+        return None
+
+    for preferred_name in preferred_names:
+        matches = list(search_dir.rglob(preferred_name))
+        if matches:
+            return matches[0]
+
+    for extension in extensions:
+        matches = sorted(search_dir.rglob(f"*{extension}"))
+        if matches:
+            return matches[0]
+
+    return None
+
+
+def download_reference_archive(url: str, download_path: Path) -> Path:
+    download_path.parent.mkdir(parents=True, exist_ok=True)
+
+    parsed_url = urlparse(url)
+    if parsed_url.scheme in ("", "file"):
+        source_path = Path(parsed_url.path if parsed_url.scheme == "file" else url)
+        if not source_path.exists():
+            raise FileNotFoundError(f"Reference dataset source does not exist: {url}")
+        shutil.copyfile(source_path, download_path)
+        return download_path
+
+    print(f"Downloading reference dataset: {url}")
+    urlretrieve(url, download_path)
+    return download_path
+
+
+def unpack_reference_archive(archive_path: Path, target_dir: Path) -> None:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if zipfile.is_zipfile(archive_path):
+        with zipfile.ZipFile(archive_path) as archive:
+            archive.extractall(target_dir)
+        return
+
+    raise ValueError(f"Unsupported reference dataset archive: {archive_path}")
+
+
+def resolve_reference_dataset(args: argparse.Namespace, layer: str) -> str:
+    config = REFERENCE_DATASETS[layer]
+    explicit_path = getattr(args, str(config["path_arg"]))
+    if explicit_path:
+        path = Path(explicit_path)
+        if not path.exists():
+            raise FileNotFoundError(f"{layer} reference path does not exist: {path}")
+        return str(path)
+
+    layer_dir = reference_data_dir(args, layer)
+    reference_file = find_reference_file(
+        layer_dir,
+        config["preferred_names"],  # type: ignore[arg-type]
+        config["extensions"],  # type: ignore[arg-type]
+    )
+    if reference_file is not None:
+        return str(reference_file)
+
+    if not args.download_missing_reference_data:
+        raise FileNotFoundError(
+            f"Could not find a usable {layer} vector dataset in {layer_dir}. "
+            "Add the reference data to the Docker image under /reference-data "
+            "or rerun with --download-missing-reference-data."
+        )
+
+    url = getattr(args, str(config["download_arg"]))
+    archive_name = Path(urlparse(url).path).name or f"{layer}.zip"
+    archive_path = layer_dir / "downloads" / archive_name
+    download_reference_archive(url, archive_path)
+    unpack_reference_archive(archive_path, layer_dir)
+
+    reference_file = find_reference_file(
+        layer_dir,
+        config["preferred_names"],  # type: ignore[arg-type]
+        config["extensions"],  # type: ignore[arg-type]
+    )
+    if reference_file is None:
+        raise FileNotFoundError(
+            f"Could not find a usable {layer} vector dataset in {layer_dir}"
+        )
+
+    return str(reference_file)
 
 
 def read_json(path: str | Path) -> dict[str, Any]:
@@ -480,7 +681,8 @@ def main() -> None:
 
     gadm_layers: list[str | None] = []
     gadm_layer_matches = []
-    if args.gadm_path:
+    if "gadm" in args.metadata_layers:
+        args.gadm_path = resolve_reference_dataset(args, "gadm")
         gadm_layers = list_layers(args.gadm_path, args.gadm_layer)
         print(f"Checking {len(gadm_layers)} GADM layer(s)")
         for layer_name in gadm_layers:
@@ -489,7 +691,8 @@ def main() -> None:
 
     wwf_layers = None
     wwf_layer_matches = None
-    if args.wwf_ecoregions_path:
+    if "ecoregion" in args.metadata_layers:
+        args.wwf_ecoregions_path = resolve_reference_dataset(args, "ecoregion")
         wwf_layers = list_layers(args.wwf_ecoregions_path, args.wwf_ecoregions_layer)
         print(f"Checking {len(wwf_layers)} WWF ecoregions layer(s)")
         wwf_layer_matches = []
