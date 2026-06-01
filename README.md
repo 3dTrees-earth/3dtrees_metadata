@@ -4,9 +4,12 @@ Extract administrative and ecoregion context for a point-cloud collection
 summary.
 
 The Python tool reads `collection_summary.json` from the standardization
-collection workflow, takes `collection.multipolygon_wkt`, computes the WGS84
-centroid, and looks that point up in reference vector datasets stored in the
-Docker image.
+collection workflow, resolves the WGS84 centroid, and looks that point up in
+reference vector datasets stored in the Docker image. If the summary already
+contains centroid longitude/latitude values, those are used directly. Otherwise,
+the tool falls back to computing the centroid from `collection.multipolygon_wkt`.
+If neither is available and `--pointcloud` is supplied, the tool derives the
+centroid from the LAS/LAZ header bounds without reading point records.
 
 GADM provides administrative boundaries only. It does not contain forest biome
 or land-cover information. WWF Terrestrial Ecoregions v2.0 provides the
@@ -15,6 +18,12 @@ ecoregion, realm, and biome context.
 ## Inputs
 
 - `--collection-summary`: JSON file produced by `tool_standard` collection mode.
+  The centroid can be supplied as `collection.centroid`, top-level `centroid`,
+  or key/value metadata with longitude/latitude aliases such as `lon`/`lat` or
+  `x`/`y`.
+- `--pointcloud`: Optional LAS/LAZ fallback used only when the collection
+  summary has no centroid and no `collection.multipolygon_wkt`. Only header
+  bounds are read.
 - `--metadata-layers`: Comma-separated layer list. Supported values are `gadm`
   and `ecoregion`.
 - `--reference-data-dir`: Directory containing reference data inside the Docker
@@ -28,12 +37,9 @@ ecoregion, realm, and biome context.
 - `--wwf-ecoregions-layer`: Optional WWF layer name. If omitted, all layers are
   checked.
 
-The Docker image expects reference data under `/reference-data/gadm` and
-`/reference-data/ecoregion`. The checked-in files are small test fixtures. For a
-production image, replace them with the real GADM and WWF datasets before
-building. GADM licensing does not allow redistribution without permission, so
-public images should only bundle GADM data if the redistribution terms are
-cleared.
+The Docker image downloads the production reference data at build time into
+`/reference-data/gadm` and `/reference-data/ecoregion`. The checked-in
+`reference-data` files are small fixtures for local tests only.
 
 ## Output
 
@@ -51,7 +57,7 @@ Default output is `additional_metadata.json`.
       "longitude": 7.85,
       "latitude": 47.99,
       "crs": "EPSG:4326",
-      "method": "shapely.centroid(collection.multipolygon_wkt)"
+      "method": "collection.centroid"
     },
     "matched": true,
     "selected_layer": "ADM_ADM_1",

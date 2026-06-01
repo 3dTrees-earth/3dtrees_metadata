@@ -5,15 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
-import shutil
 from typing import Any
-from urllib.parse import urlparse
-from urllib.request import urlretrieve
-import zipfile
 
 import fiona
+import laspy
 from pyproj import CRS, Transformer
 from shapely.geometry import Point, shape
 from shapely.ops import transform
@@ -22,21 +20,15 @@ from shapely import wkt
 
 SUPPORTED_METADATA_LAYERS = ("gadm", "ecoregion")
 DEFAULT_REFERENCE_DATA_DIR = "/reference-data"
-DEFAULT_GADM_URL = "https://geodata.ucdavis.edu/gadm/gadm4.1/gadm_410-gpkg.zip"
-DEFAULT_WWF_ECOREGIONS_URL = (
-    "https://files.worldwildlife.org/wwfcmsprod/files/Publication/file/"
-    "6kcchn7e3u_official_teow.zip"
-)
+CENTROID_KEYS = ("centroid", "center", "centre", "centorid")
 
 REFERENCE_DATASETS = {
     "gadm": {
-        "download_arg": "gadm_url",
         "path_arg": "gadm_path",
         "preferred_names": ("gadm_410.gpkg", "gadm.gpkg", "gadm_fixture.geojson"),
         "extensions": (".gpkg", ".geojson", ".shp"),
     },
     "ecoregion": {
-        "download_arg": "wwf_ecoregions_url",
         "path_arg": "wwf_ecoregions_path",
         "preferred_names": (
             "wwf_terr_ecos.shp",
@@ -88,42 +80,24 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated metadata layers to extract: gadm,ecoregion",
     )
     parser.add_argument(
+        "--pointcloud",
+        "--point-cloud",
+        "--point_cloud",
+        dest="pointcloud",
+        default="",
+        help=(
+            "Optional LAS/LAZ point cloud used only as a centroid fallback. "
+            "Only header bounds are read."
+        ),
+    )
+    parser.add_argument(
         "--reference-data-dir",
         "--reference_data_dir",
         dest="reference_data_dir",
         default=os.environ.get(
             "THREEDTREES_METADATA_REFERENCE_DIR", DEFAULT_REFERENCE_DATA_DIR
         ),
-        help=(
-            "Directory used for cached reference datasets. Missing datasets are "
-            "downloaded into this directory."
-        ),
-    )
-    parser.add_argument(
-        "--download-missing-reference-data",
-        action="store_true",
-        help=(
-            "Download missing reference datasets into --reference-data-dir. "
-            "By default the tool expects reference data to be present in the Docker image."
-        ),
-    )
-    parser.add_argument(
-        "--gadm-url",
-        "--gadm_url",
-        dest="gadm_url",
-        default=os.environ.get("THREEDTREES_GADM_URL", DEFAULT_GADM_URL),
-        help="Download URL for the GADM reference dataset.",
-    )
-    parser.add_argument(
-        "--wwf-ecoregions-url",
-        "--wwf_ecoregions_url",
-        "--wwf-url",
-        "--wwf_url",
-        dest="wwf_ecoregions_url",
-        default=os.environ.get(
-            "THREEDTREES_WWF_ECOREGIONS_URL", DEFAULT_WWF_ECOREGIONS_URL
-        ),
-        help="Download URL for the WWF Terrestrial Ecoregions v2.0 dataset.",
+        help="Directory containing reference datasets bundled in the Docker image.",
     )
     parser.add_argument(
         "--gadm-path",
@@ -180,6 +154,8 @@ def parse_args() -> argparse.Namespace:
     collection_summary = Path(args.collection_summary)
     if not collection_summary.exists():
         parser.error(f"Collection summary does not exist: {collection_summary}")
+    if args.pointcloud and not Path(args.pointcloud).exists():
+        parser.error(f"Point cloud does not exist: {args.pointcloud}")
     try:
         selected_layers = parse_metadata_layers(args.metadata_layers)
     except ValueError as exc:
@@ -230,32 +206,6 @@ def find_reference_file(
     return None
 
 
-def download_reference_archive(url: str, download_path: Path) -> Path:
-    download_path.parent.mkdir(parents=True, exist_ok=True)
-
-    parsed_url = urlparse(url)
-    if parsed_url.scheme in ("", "file"):
-        source_path = Path(parsed_url.path if parsed_url.scheme == "file" else url)
-        if not source_path.exists():
-            raise FileNotFoundError(f"Reference dataset source does not exist: {url}")
-        shutil.copyfile(source_path, download_path)
-        return download_path
-
-    print(f"Downloading reference dataset: {url}")
-    urlretrieve(url, download_path)
-    return download_path
-
-
-def unpack_reference_archive(archive_path: Path, target_dir: Path) -> None:
-    target_dir.mkdir(parents=True, exist_ok=True)
-    if zipfile.is_zipfile(archive_path):
-        with zipfile.ZipFile(archive_path) as archive:
-            archive.extractall(target_dir)
-        return
-
-    raise ValueError(f"Unsupported reference dataset archive: {archive_path}")
-
-
 def resolve_reference_dataset(args: argparse.Namespace, layer: str) -> str:
     config = REFERENCE_DATASETS[layer]
     explicit_path = getattr(args, str(config["path_arg"]))
@@ -265,44 +215,153 @@ def resolve_reference_dataset(args: argparse.Namespace, layer: str) -> str:
             raise FileNotFoundError(f"{layer} reference path does not exist: {path}")
         return str(path)
 
+    root_dir = Path(args.reference_data_dir)
     layer_dir = reference_data_dir(args, layer)
-    reference_file = find_reference_file(
-        layer_dir,
-        config["preferred_names"],  # type: ignore[arg-type]
-        config["extensions"],  # type: ignore[arg-type]
-    )
-    if reference_file is not None:
-        return str(reference_file)
-
-    if not args.download_missing_reference_data:
-        raise FileNotFoundError(
-            f"Could not find a usable {layer} vector dataset in {layer_dir}. "
-            "Add the reference data to the Docker image under /reference-data "
-            "or rerun with --download-missing-reference-data."
+    for search_dir in (layer_dir, root_dir):
+        reference_file = find_reference_file(
+            search_dir,
+            config["preferred_names"],  # type: ignore[arg-type]
+            config["extensions"],  # type: ignore[arg-type]
         )
+        if reference_file is not None:
+            return str(reference_file)
 
-    url = getattr(args, str(config["download_arg"]))
-    archive_name = Path(urlparse(url).path).name or f"{layer}.zip"
-    archive_path = layer_dir / "downloads" / archive_name
-    download_reference_archive(url, archive_path)
-    unpack_reference_archive(archive_path, layer_dir)
-
-    reference_file = find_reference_file(
-        layer_dir,
-        config["preferred_names"],  # type: ignore[arg-type]
-        config["extensions"],  # type: ignore[arg-type]
+    raise FileNotFoundError(
+        f"Could not find a usable {layer} vector dataset in {layer_dir}. "
+        "Reference data must be bundled in the Docker image under /reference-data "
+        "or passed explicitly with the layer path argument."
     )
-    if reference_file is None:
-        raise FileNotFoundError(
-            f"Could not find a usable {layer} vector dataset in {layer_dir}"
-        )
-
-    return str(reference_file)
 
 
 def read_json(path: str | Path) -> dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def as_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_mapping_keys(value: dict[str, Any]) -> dict[str, Any]:
+    return {str(key).strip().lower(): item for key, item in value.items()}
+
+
+def key_value_list_to_mapping(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, list):
+        return None
+
+    pairs: dict[str, Any] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        if "key" not in item or "value" not in item:
+            continue
+        key = str(item["key"]).strip().lower()
+        if key:
+            pairs[key] = item["value"]
+
+    return pairs or None
+
+
+def value_from_aliases(mapping: dict[str, Any], aliases: tuple[str, ...]) -> Any:
+    normalized = normalize_mapping_keys(mapping)
+    for alias in aliases:
+        if alias in normalized:
+            return normalized[alias]
+    return None
+
+
+def point_from_lon_lat(lon_value: Any, lat_value: Any) -> Point | None:
+    longitude = as_float(lon_value)
+    latitude = as_float(lat_value)
+    if longitude is None or latitude is None:
+        return None
+    return Point(longitude, latitude)
+
+
+def point_from_centroid_value(value: Any) -> Point | None:
+    if isinstance(value, dict):
+        mapping = normalize_mapping_keys(value)
+        if "key" in mapping and "value" in mapping:
+            if str(mapping["key"]).strip().lower() in CENTROID_KEYS:
+                return point_from_centroid_value(mapping["value"])
+            return None
+        return point_from_lon_lat(
+            value_from_aliases(mapping, ("longitude", "lon", "lng", "x")),
+            value_from_aliases(mapping, ("latitude", "lat", "y")),
+        )
+
+    key_value_mapping = key_value_list_to_mapping(value)
+    if key_value_mapping:
+        return point_from_centroid_value(key_value_mapping)
+
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return point_from_lon_lat(value[0], value[1])
+
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.replace(";", ",").split(",")]
+        if len(parts) == 1:
+            parts = value.split()
+        if len(parts) >= 2:
+            return point_from_lon_lat(parts[0], parts[1])
+
+    return None
+
+
+def centroid_from_mapping(
+    mapping: dict[str, Any], source: str
+) -> tuple[Point, str] | None:
+    normalized = normalize_mapping_keys(mapping)
+
+    for centroid_key in CENTROID_KEYS:
+        if centroid_key in normalized:
+            point = point_from_centroid_value(normalized[centroid_key])
+            if point is not None:
+                return point, f"{source}.{centroid_key}"
+
+    point = point_from_lon_lat(
+        value_from_aliases(
+            normalized,
+            ("centroid_longitude", "centroid_lon", "longitude", "lon", "lng", "x"),
+        ),
+        value_from_aliases(
+            normalized, ("centroid_latitude", "centroid_lat", "latitude", "lat", "y")
+        ),
+    )
+    if point is not None:
+        return point, f"{source} longitude/latitude keys"
+
+    key_value_mapping = key_value_list_to_mapping(mapping)
+    if key_value_mapping:
+        return centroid_from_mapping(key_value_mapping, source)
+
+    return None
+
+
+def centroid_from_key_value_containers(
+    summary: dict[str, Any], source: str
+) -> tuple[Point, str] | None:
+    for key in ("metadata", "properties", "attributes"):
+        value = summary.get(key)
+        key_value_mapping = key_value_list_to_mapping(value)
+        if not key_value_mapping:
+            continue
+
+        centroid = centroid_from_mapping(key_value_mapping, f"{source}.{key}")
+        if centroid is not None:
+            return centroid
+
+        nested = value_from_aliases(key_value_mapping, CENTROID_KEYS)
+        point = point_from_centroid_value(nested)
+        if point is not None:
+            return point, f"{source}.{key}.centroid"
+
+    return None
 
 
 def extract_multipolygon_wkt(summary: dict[str, Any]) -> str:
@@ -319,6 +378,35 @@ def extract_multipolygon_wkt(summary: dict[str, Any]) -> str:
     raise ValueError("Could not find collection.multipolygon_wkt in collection summary JSON")
 
 
+def extract_centroid(
+    summary: dict[str, Any], pointcloud_path: str | Path | None = None
+) -> tuple[Point, str]:
+    for value, source in ((summary.get("collection"), "collection"), (summary, "root")):
+        if not isinstance(value, dict):
+            continue
+
+        direct = centroid_from_mapping(value, source)
+        if direct is not None:
+            return direct
+
+        from_container = centroid_from_key_value_containers(value, source)
+        if from_container is not None:
+            return from_container
+
+    try:
+        multipolygon_wkt = extract_multipolygon_wkt(summary)
+    except ValueError:
+        if pointcloud_path:
+            return pointcloud_centroid_from_header(pointcloud_path)
+        raise ValueError(
+            "Could not find a centroid or collection.multipolygon_wkt in the "
+            "collection summary JSON. Pass --pointcloud to derive the centroid "
+            "from LAS/LAZ header bounds."
+        )
+
+    return centroid_from_wkt(multipolygon_wkt), "shapely.centroid(collection.multipolygon_wkt)"
+
+
 def centroid_from_wkt(multipolygon_wkt: str) -> Point:
     geometry = wkt.loads(multipolygon_wkt)
     if geometry.is_empty:
@@ -327,6 +415,43 @@ def centroid_from_wkt(multipolygon_wkt: str) -> Point:
     if centroid.is_empty:
         raise ValueError("Could not compute centroid from collection.multipolygon_wkt")
     return centroid
+
+
+def validate_finite_point(point: Point, source: str) -> None:
+    if not math.isfinite(point.x) or not math.isfinite(point.y):
+        raise ValueError(f"{source} produced a non-finite centroid")
+
+
+def pointcloud_centroid_from_header(pointcloud_path: str | Path) -> tuple[Point, str]:
+    path = Path(pointcloud_path)
+    with laspy.open(path) as reader:
+        header = reader.header
+        if header.point_count <= 0:
+            raise ValueError(f"Point cloud contains no points: {path}")
+
+        center_x = (float(header.mins[0]) + float(header.maxs[0])) / 2
+        center_y = (float(header.mins[1]) + float(header.maxs[1])) / 2
+        point = Point(center_x, center_y)
+        validate_finite_point(point, "pointcloud header bounds")
+
+        source_crs = header.parse_crs()
+
+    if source_crs is None:
+        if -180 <= point.x <= 180 and -90 <= point.y <= 90:
+            return point, "pointcloud.header.bounds"
+        raise ValueError(
+            "Point cloud header does not contain a CRS, and header bounds do not "
+            "look like WGS84 longitude/latitude coordinates."
+        )
+
+    crs = CRS.from_user_input(source_crs)
+    wgs84 = CRS.from_epsg(4326)
+    if crs != wgs84:
+        transformer = Transformer.from_crs(crs, wgs84, always_xy=True)
+        point = transform(transformer.transform, point)
+        validate_finite_point(point, "transformed pointcloud header bounds")
+
+    return point, "pointcloud.header.bounds"
 
 
 def list_layers(vector_path: str, layer_name: str) -> list[str | None]:
@@ -425,6 +550,20 @@ def open_layer(vector_path: str, layer_name: str | None) -> fiona.Collection:
     return fiona.open(vector_path, layer=layer_name)
 
 
+def features_near_point(collection: fiona.Collection, point: Point) -> Any:
+    epsilon = 1e-9
+    bbox = (
+        point.x - epsilon,
+        point.y - epsilon,
+        point.x + epsilon,
+        point.y + epsilon,
+    )
+    try:
+        return collection.filter(bbox=bbox)
+    except Exception:
+        return collection
+
+
 def match_layer(
     vector_path: str,
     layer_name: str | None,
@@ -440,7 +579,7 @@ def match_layer(
         layer_point = point_for_layer(point_wgs84, collection_crs(collection))
         hits: list[dict[str, Any]] = []
 
-        for feature in collection:
+        for feature in features_near_point(collection, layer_point):
             geometry = feature.get("geometry")
             if not geometry:
                 continue
@@ -552,6 +691,7 @@ def select_best_match(layer_matches: list[dict[str, Any]]) -> dict[str, Any] | N
 def build_result(
     args: argparse.Namespace,
     centroid: Point,
+    centroid_method: str,
     gadm_layers: list[str | None],
     gadm_layer_matches: list[dict[str, Any]],
     wwf_layers: list[str | None] | None = None,
@@ -574,7 +714,7 @@ def build_result(
                 "longitude": centroid.x,
                 "latitude": centroid.y,
                 "crs": "EPSG:4326",
-                "method": "shapely.centroid(collection.multipolygon_wkt)",
+                "method": centroid_method,
             },
             "matches_by_layer": gadm_layer_matches,
         }
@@ -611,6 +751,7 @@ def build_result(
         result["ecoregion"] = build_ecoregion_result(
             args=args,
             centroid=centroid,
+            centroid_method=centroid_method,
             layers=wwf_layers or [],
             layer_matches=wwf_layer_matches or [],
         )
@@ -621,6 +762,7 @@ def build_result(
 def build_ecoregion_result(
     args: argparse.Namespace,
     centroid: Point,
+    centroid_method: str,
     layers: list[str | None],
     layer_matches: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -638,7 +780,7 @@ def build_ecoregion_result(
             "longitude": centroid.x,
             "latitude": centroid.y,
             "crs": "EPSG:4326",
-            "method": "shapely.centroid(collection.multipolygon_wkt)",
+            "method": centroid_method,
         },
         "matches_by_layer": layer_matches,
     }
@@ -674,10 +816,9 @@ def build_ecoregion_result(
 def main() -> None:
     args = parse_args()
     summary = read_json(args.collection_summary)
-    multipolygon_wkt = extract_multipolygon_wkt(summary)
-    centroid = centroid_from_wkt(multipolygon_wkt)
+    centroid, centroid_method = extract_centroid(summary, args.pointcloud or None)
 
-    print(f"Using centroid lon={centroid.x} lat={centroid.y}")
+    print(f"Using centroid lon={centroid.x} lat={centroid.y} ({centroid_method})")
 
     gadm_layers: list[str | None] = []
     gadm_layer_matches = []
@@ -714,6 +855,7 @@ def main() -> None:
     result = build_result(
         args,
         centroid,
+        centroid_method,
         gadm_layers,
         gadm_layer_matches,
         wwf_layers=wwf_layers,
