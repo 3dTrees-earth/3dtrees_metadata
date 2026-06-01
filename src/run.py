@@ -697,27 +697,32 @@ def build_result(
     wwf_layers: list[str | None] | None = None,
     wwf_layer_matches: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-
-    if args.gadm_path:
-        layer_names = [layer or Path(args.gadm_path).stem for layer in gadm_layers]
-        best_match = select_best_match(gadm_layer_matches)
-        warnings: list[str] = []
-
-        base_admin: dict[str, Any] = {
-            "source": {
-                "dataset": "GADM",
-                "path": Path(args.gadm_path).name,
-                "layers_checked": layer_names,
-            },
+    result: dict[str, Any] = {
+        "lookup": {
             "centroid": {
                 "longitude": centroid.x,
                 "latitude": centroid.y,
                 "crs": "EPSG:4326",
                 "method": centroid_method,
             },
-            "matches_by_layer": gadm_layer_matches,
+            "reference_layers_checked": [],
         }
+    }
+
+    if args.gadm_path:
+        layer_names = [layer or Path(args.gadm_path).stem for layer in gadm_layers]
+        result["lookup"]["reference_layers_checked"].append(
+            {
+                "metadata_layer": "gadm",
+                "dataset": "GADM",
+                "path": Path(args.gadm_path).name,
+                "layers_checked": layer_names,
+            }
+        )
+        best_match = select_best_match(gadm_layer_matches)
+        warnings: list[str] = []
+
+        base_admin: dict[str, Any] = {}
 
         if best_match is None:
             warnings.append("Centroid did not intersect any GADM feature")
@@ -748,42 +753,29 @@ def build_result(
         result["admin"] = base_admin
 
     if args.wwf_ecoregions_path:
+        layer_names = [
+            layer or Path(args.wwf_ecoregions_path).stem for layer in (wwf_layers or [])
+        ]
+        result["lookup"]["reference_layers_checked"].append(
+            {
+                "metadata_layer": "ecoregion",
+                "dataset": "WWF Terrestrial Ecoregions v2.0",
+                "path": Path(args.wwf_ecoregions_path).name,
+                "layers_checked": layer_names,
+            }
+        )
         result["ecoregion"] = build_ecoregion_result(
-            args=args,
-            centroid=centroid,
-            centroid_method=centroid_method,
-            layers=wwf_layers or [],
             layer_matches=wwf_layer_matches or [],
         )
 
     return result
 
 
-def build_ecoregion_result(
-    args: argparse.Namespace,
-    centroid: Point,
-    centroid_method: str,
-    layers: list[str | None],
-    layer_matches: list[dict[str, Any]],
-) -> dict[str, Any]:
-    layer_names = [layer or Path(args.wwf_ecoregions_path).stem for layer in layers]
+def build_ecoregion_result(layer_matches: list[dict[str, Any]]) -> dict[str, Any]:
     best_match = select_best_match(layer_matches)
     warnings: list[str] = []
 
-    ecoregion: dict[str, Any] = {
-        "source": {
-            "dataset": "WWF Terrestrial Ecoregions v2.0",
-            "path": Path(args.wwf_ecoregions_path).name,
-            "layers_checked": layer_names,
-        },
-        "centroid": {
-            "longitude": centroid.x,
-            "latitude": centroid.y,
-            "crs": "EPSG:4326",
-            "method": centroid_method,
-        },
-        "matches_by_layer": layer_matches,
-    }
+    ecoregion: dict[str, Any] = {}
 
     if best_match is None:
         warnings.append("Centroid did not intersect any WWF ecoregion feature")

@@ -47,18 +47,29 @@ Default output is `additional_metadata.json`.
 
 ```json
 {
-  "admin": {
-    "source": {
-      "dataset": "GADM",
-      "path": "gadm41_DEU.gpkg",
-      "layers_checked": ["ADM_ADM_0", "ADM_ADM_1"]
-    },
+  "lookup": {
     "centroid": {
       "longitude": 7.85,
       "latitude": 47.99,
       "crs": "EPSG:4326",
       "method": "collection.centroid"
     },
+    "reference_layers_checked": [
+      {
+        "metadata_layer": "gadm",
+        "dataset": "GADM",
+        "path": "gadm41_DEU.gpkg",
+        "layers_checked": ["ADM_ADM_0", "ADM_ADM_1"]
+      },
+      {
+        "metadata_layer": "ecoregion",
+        "dataset": "WWF Terrestrial Ecoregions v2.0",
+        "path": "wwf_terr_ecos.shp",
+        "layers_checked": ["wwf_terr_ecos"]
+      }
+    ]
+  },
+  "admin": {
     "matched": true,
     "selected_layer": "ADM_ADM_1",
     "selected_level": 1,
@@ -74,11 +85,6 @@ Default output is `additional_metadata.json`.
     }
   },
   "ecoregion": {
-    "source": {
-      "dataset": "WWF Terrestrial Ecoregions v2.0",
-      "path": "wwf_terr_ecos.shp",
-      "layers_checked": ["wwf_terr_ecos"]
-    },
     "matched": true,
     "selected_layer": "wwf_terr_ecos",
     "ecoregion_name": "Black Forest",
