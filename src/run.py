@@ -8,7 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import fiona
 import laspy
@@ -21,6 +21,71 @@ from shapely import wkt
 SUPPORTED_METADATA_LAYERS = ("gadm", "ecoregion")
 DEFAULT_REFERENCE_DATA_DIR = "/reference-data"
 CENTROID_KEYS = ("centroid", "center", "centre", "centorid")
+GADM_LEVEL_FIELDS = {
+    0: (
+        "GID_0",
+        "NAME_0",
+        "VARNAME_0",
+        "COUNTRY",
+        "CONTINENT",
+        "SUBCONT",
+        "SOVEREIGN",
+        "GOVERNEDBY",
+        "DISPUTEDBY",
+        "REGION",
+        "VARREGION",
+    ),
+    1: (
+        "GID_1",
+        "NAME_1",
+        "VARNAME_1",
+        "NL_NAME_1",
+        "ISO_1",
+        "HASC_1",
+        "CC_1",
+        "TYPE_1",
+        "ENGTYPE_1",
+        "VALIDFR_1",
+    ),
+    2: (
+        "GID_2",
+        "NAME_2",
+        "VARNAME_2",
+        "NL_NAME_2",
+        "HASC_2",
+        "CC_2",
+        "TYPE_2",
+        "ENGTYPE_2",
+        "VALIDFR_2",
+    ),
+    3: (
+        "GID_3",
+        "NAME_3",
+        "VARNAME_3",
+        "NL_NAME_3",
+        "HASC_3",
+        "CC_3",
+        "TYPE_3",
+        "ENGTYPE_3",
+        "VALIDFR_3",
+    ),
+    4: (
+        "GID_4",
+        "NAME_4",
+        "VARNAME_4",
+        "CC_4",
+        "TYPE_4",
+        "ENGTYPE_4",
+        "VALIDFR_4",
+    ),
+    5: (
+        "GID_5",
+        "NAME_5",
+        "CC_5",
+        "TYPE_5",
+        "ENGTYPE_5",
+    ),
+}
 
 REFERENCE_DATASETS = {
     "gadm": {
@@ -478,8 +543,60 @@ def infer_admin_level(fields: list[str]) -> int | None:
     return max(levels) if levels else None
 
 
+def has_raw_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    return True
+
+
+def infer_populated_admin_level(raw_fields: dict[str, Any]) -> int | None:
+    levels: list[int] = []
+    for level in range(6):
+        if level == 0:
+            level_items = (
+                (key, value)
+                for key, value in raw_fields.items()
+                if key.endswith("_0") or key in {"COUNTRY", "CONTINENT", "SUBCONT"}
+            )
+        else:
+            level_items = (
+                (key, value)
+                for key, value in raw_fields.items()
+                if key.endswith(f"_{level}")
+            )
+
+        if any(has_raw_value(value) for _, value in level_items):
+            levels.append(level)
+
+    return max(levels) if levels else None
+
+
+def build_gadm_levels(raw_fields: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(level): {
+            field_name: raw_fields.get(field_name)
+            for field_name in field_names
+        }
+        for level, field_names in GADM_LEVEL_FIELDS.items()
+    }
+
+
+def build_null_gadm_raw_fields() -> dict[str, Any]:
+    raw_fields: dict[str, Any] = {}
+    for field_names in GADM_LEVEL_FIELDS.values():
+        for field_name in field_names:
+            raw_fields[field_name] = None
+    return raw_fields
+
+
 def normalize_value(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value if value.strip() else None
+    if isinstance(value, (int, float, bool)):
         return value
     return str(value)
 
@@ -488,40 +605,7 @@ def normalize_properties(properties: Any) -> dict[str, Any]:
     return {
         str(key): normalize_value(value)
         for key, value in dict(properties).items()
-        if value is not None
     }
-
-
-def build_admin_levels(raw_fields: dict[str, Any]) -> list[dict[str, Any]]:
-    admin_levels: list[dict[str, Any]] = []
-
-    for level in range(6):
-        gid_key = f"GID_{level}"
-        name_key = "COUNTRY" if level == 0 else f"NAME_{level}"
-        type_key = f"TYPE_{level}"
-        engtype_key = f"ENGTYPE_{level}"
-
-        gid = raw_fields.get(gid_key)
-        name = raw_fields.get(name_key)
-        if name is None and level == 0:
-            name = raw_fields.get("NAME_0")
-
-        if gid is None and name is None:
-            continue
-
-        entry: dict[str, Any] = {
-            "level": level,
-            "gid": gid,
-            "name": name,
-        }
-        if raw_fields.get(type_key) is not None:
-            entry["type"] = raw_fields[type_key]
-        if raw_fields.get(engtype_key) is not None:
-            entry["engtype"] = raw_fields[engtype_key]
-
-        admin_levels.append(entry)
-
-    return admin_levels
 
 
 def collection_crs(collection: fiona.Collection) -> CRS | None:
@@ -568,8 +652,8 @@ def match_layer(
     vector_path: str,
     layer_name: str | None,
     point_wgs84: Point,
-    level_fn=infer_admin_level,
-    include_admin_levels: bool = True,
+    level_fn: Callable[[list[str]], int | None] = infer_admin_level,
+    matched_level_fn: Callable[[dict[str, Any]], int | None] | None = None,
 ) -> dict[str, Any]:
     display_layer = layer_name or Path(vector_path).stem
 
@@ -598,33 +682,13 @@ def match_layer(
     match = {
         "layer": display_layer,
         "matched": True,
-        "level": level_fn(list(raw_fields.keys())),
+        "level": matched_level_fn(raw_fields)
+        if matched_level_fn is not None
+        else level_fn(list(raw_fields.keys())),
         "match_count": len(hits),
         "raw_fields": raw_fields,
     }
-    if include_admin_levels:
-        match["admin_levels"] = build_admin_levels(raw_fields)
     return match
-
-
-WWF_BIOME_NAMES = {
-    1: "Tropical & Subtropical Moist Broadleaf Forests",
-    2: "Tropical & Subtropical Dry Broadleaf Forests",
-    3: "Tropical & Subtropical Coniferous Forests",
-    4: "Temperate Broadleaf & Mixed Forests",
-    5: "Temperate Conifer Forests",
-    6: "Boreal Forests/Taiga",
-    7: "Tropical & Subtropical Grasslands, Savannas & Shrublands",
-    8: "Temperate Grasslands, Savannas & Shrublands",
-    9: "Flooded Grasslands & Savannas",
-    10: "Montane Grasslands & Shrublands",
-    11: "Tundra",
-    12: "Mediterranean Forests, Woodlands & Scrub",
-    13: "Deserts & Xeric Shrublands",
-    14: "Mangroves",
-}
-
-FOREST_BIOME_CODES = {1, 2, 3, 4, 5, 6, 12, 14}
 
 
 def infer_ecoregion_level(fields: list[str]) -> int | None:
@@ -634,47 +698,6 @@ def infer_ecoregion_level(fields: list[str]) -> int | None:
         if "ECO_NAME" in normalized or "ECO_ID" in normalized or "BIOME" in normalized
         else None
     )
-
-
-def first_present(raw_fields: dict[str, Any], keys: list[str]) -> Any:
-    for key in keys:
-        value = raw_fields.get(key)
-        if value is not None and value != "":
-            return value
-        for raw_key, raw_value in raw_fields.items():
-            if raw_key.upper() == key.upper() and raw_value is not None and raw_value != "":
-                return raw_value
-    return None
-
-
-def as_int(value: Any) -> int | None:
-    if value is None or value == "":
-        return None
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
-
-
-def build_ecoregion_summary(best_match: dict[str, Any]) -> dict[str, Any]:
-    raw_fields = best_match.get("raw_fields", {})
-    biome_code = as_int(first_present(raw_fields, ["BIOME", "BIOME_NUM", "BIOME_ID"]))
-    biome_name = first_present(raw_fields, ["BIOME_NAME", "BIOME_DESC"])
-    if biome_name is None and biome_code is not None:
-        biome_name = WWF_BIOME_NAMES.get(biome_code)
-
-    ecoregion_id = first_present(raw_fields, ["ECO_ID", "ECO_NUM", "ECO_CODE"])
-
-    return {
-        "ecoregion_name": first_present(raw_fields, ["ECO_NAME", "ECOREGION"]),
-        "ecoregion_id": ecoregion_id,
-        "realm": first_present(raw_fields, ["REALM"]),
-        "biome_code": biome_code,
-        "biome_name": biome_name,
-        "is_forest_biome": biome_code in FOREST_BIOME_CODES
-        if biome_code is not None
-        else None,
-    }
 
 
 def select_best_match(layer_matches: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -726,9 +749,14 @@ def build_result(
 
         if best_match is None:
             warnings.append("Centroid did not intersect any GADM feature")
+            raw_fields = build_null_gadm_raw_fields()
             base_admin.update(
                 {
                     "matched": False,
+                    "selected_layer": None,
+                    "match_count": 0,
+                    "raw_fields": raw_fields,
+                    "levels": build_gadm_levels(raw_fields),
                     "warnings": warnings,
                 }
             )
@@ -743,9 +771,9 @@ def build_result(
                 {
                     "matched": True,
                     "selected_layer": best_match.get("layer"),
-                    "selected_level": best_match.get("level"),
-                    "admin_levels": best_match.get("admin_levels", []),
+                    "match_count": match_count,
                     "raw_fields": best_match.get("raw_fields", {}),
+                    "levels": build_gadm_levels(best_match.get("raw_fields", {})),
                     "warnings": warnings,
                 }
             )
@@ -797,7 +825,7 @@ def build_ecoregion_result(layer_matches: list[dict[str, Any]]) -> dict[str, Any
         {
             "matched": True,
             "selected_layer": best_match.get("layer"),
-            **build_ecoregion_summary(best_match),
+            "match_count": match_count,
             "raw_fields": best_match.get("raw_fields", {}),
             "warnings": warnings,
         }
@@ -820,7 +848,14 @@ def main() -> None:
         print(f"Checking {len(gadm_layers)} GADM layer(s)")
         for layer_name in gadm_layers:
             print(f"Reading GADM layer: {layer_name or Path(args.gadm_path).stem}")
-            gadm_layer_matches.append(match_layer(args.gadm_path, layer_name, centroid))
+            gadm_layer_matches.append(
+                match_layer(
+                    args.gadm_path,
+                    layer_name,
+                    centroid,
+                    matched_level_fn=infer_populated_admin_level,
+                )
+            )
 
     wwf_layers = None
     wwf_layer_matches = None
@@ -840,7 +875,6 @@ def main() -> None:
                     layer_name,
                     centroid,
                     level_fn=infer_ecoregion_level,
-                    include_admin_levels=False,
                 )
             )
 
