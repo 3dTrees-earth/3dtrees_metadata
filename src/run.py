@@ -134,8 +134,12 @@ def parse_args() -> argparse.Namespace:
         "--collection_summary",
         "--input",
         dest="collection_summary",
-        required=True,
-        help="collection_summary.json produced by tool_standard collection mode",
+        default="",
+        help=(
+            "Optional collection_summary.json produced by tool_standard collection "
+            "mode. If omitted, --pointcloud is required and its header bounds are "
+            "used as the centroid source."
+        ),
     )
     parser.add_argument(
         "--metadata-layers",
@@ -151,8 +155,9 @@ def parse_args() -> argparse.Namespace:
         dest="pointcloud",
         default="",
         help=(
-            "Optional LAS/LAZ point cloud used only as a centroid fallback. "
-            "Only header bounds are read."
+            "Optional LAS/LAZ point cloud used as a centroid fallback or as the "
+            "primary input when no collection summary is supplied. Only header "
+            "bounds are read."
         ),
     )
     parser.add_argument(
@@ -216,9 +221,12 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
 
-    collection_summary = Path(args.collection_summary)
-    if not collection_summary.exists():
-        parser.error(f"Collection summary does not exist: {collection_summary}")
+    if not args.collection_summary and not args.pointcloud:
+        parser.error("Either --collection-summary or --pointcloud is required")
+    if args.collection_summary:
+        collection_summary = Path(args.collection_summary)
+        if not collection_summary.exists():
+            parser.error(f"Collection summary does not exist: {collection_summary}")
     if args.pointcloud and not Path(args.pointcloud).exists():
         parser.error(f"Point cloud does not exist: {args.pointcloud}")
     try:
@@ -835,8 +843,11 @@ def build_ecoregion_result(layer_matches: list[dict[str, Any]]) -> dict[str, Any
 
 def main() -> None:
     args = parse_args()
-    summary = read_json(args.collection_summary)
-    centroid, centroid_method = extract_centroid(summary, args.pointcloud or None)
+    if args.collection_summary:
+        summary = read_json(args.collection_summary)
+        centroid, centroid_method = extract_centroid(summary, args.pointcloud or None)
+    else:
+        centroid, centroid_method = pointcloud_centroid_from_header(args.pointcloud)
 
     print(f"Using centroid lon={centroid.x} lat={centroid.y} ({centroid_method})")
 

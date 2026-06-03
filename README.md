@@ -8,8 +8,9 @@ collection workflow, resolves the WGS84 centroid, and looks that point up in
 reference vector datasets stored in the Docker image. If the summary already
 contains centroid longitude/latitude values, those are used directly. Otherwise,
 the tool falls back to computing the centroid from `collection.multipolygon_wkt`.
-If neither is available and `--pointcloud` is supplied, the tool derives the
-centroid from the LAS/LAZ header bounds without reading point records.
+If neither is available and `--pointcloud` is supplied, or if only `--pointcloud`
+is supplied, the tool derives the centroid from the LAS/LAZ header bounds without
+reading point records.
 
 GADM provides administrative boundary attributes. WWF Terrestrial Ecoregions
 v2.0 provides ecoregion, realm, and biome attributes. The tool returns matched
@@ -22,13 +23,13 @@ still emitted with known administrative fields set to JSON `null`.
 
 ## Inputs
 
-- `--collection-summary`: JSON file produced by `tool_standard` collection mode.
-  The centroid can be supplied as `collection.centroid`, top-level `centroid`,
-  or key/value metadata with longitude/latitude aliases such as `lon`/`lat` or
-  `x`/`y`.
-- `--pointcloud`: Optional LAS/LAZ fallback used only when the collection
-  summary has no centroid and no `collection.multipolygon_wkt`. Only header
-  bounds are read.
+- `--collection-summary`: Optional JSON file produced by `tool_standard`
+  collection mode. The centroid can be supplied as `collection.centroid`,
+  top-level `centroid`, or key/value metadata with longitude/latitude aliases
+  such as `lon`/`lat` or `x`/`y`.
+- `--pointcloud`: Optional LAS/LAZ used when the collection summary has no
+  centroid and no `collection.multipolygon_wkt`, or as the primary input when no
+  collection summary is supplied. Only header bounds are read.
 - `--metadata-layers`: Comma-separated layer list. Supported values are `gadm`
   and `ecoregion`.
 - `--reference-data-dir`: Directory containing reference data inside the Docker
